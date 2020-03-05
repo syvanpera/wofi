@@ -401,6 +401,18 @@ static void expand(GtkExpander* expander, gpointer data) {
 	gtk_widget_set_visible(box, !gtk_expander_get_expanded(expander));
 }
 
+static void update_surface_size(void) {
+	if(wl != NULL) {
+		zwlr_layer_surface_v1_set_size(wlr_surface, width, height);
+		wl_surface_commit(wl_surface);
+		wl_display_roundtrip(wl);
+	}
+
+	gtk_window_resize(GTK_WINDOW(window), width, height);
+	gtk_widget_set_size_request(scroll, width, height);
+	printf("%lux%lu\n", width, height);
+}
+
 static void widget_allocate(GtkWidget* widget, GdkRectangle* allocation, gpointer data) {
 	(void) data;
 	if(max_height > 0) {
@@ -421,14 +433,8 @@ static void widget_allocate(GtkWidget* widget, GdkRectangle* allocation, gpointe
 	} else {
 		max_height = allocation->height;
 	}
-	if(wl != NULL) {
-		zwlr_layer_surface_v1_set_size(wlr_surface, width, max_height * lines);
-		wl_surface_commit(wl_surface);
-		wl_display_roundtrip(wl);
-	}
-
-	gtk_window_resize(GTK_WINDOW(window), width, max_height * lines);
-	gtk_widget_set_size_request(scroll, width, max_height * lines);
+	height = max_height * lines;
+	update_surface_size();
 }
 
 static gboolean _insert_widget(gpointer data) {
@@ -1291,10 +1297,30 @@ static void get_output_pos(void* data, struct zxdg_output_v1* output, int32_t x,
 	node->y = y;
 }
 
+static gboolean do_percent_size(gpointer data) {
+	char** geo_str = data;
+	bool width_percent = strchr(geo_str[0], '%') != NULL;
+	bool height_percent = strchr(geo_str[1], '%') != NULL && lines == 0;
+	GdkMonitor* monitor = gdk_display_get_monitor_at_window(gdk_display_get_default(), gtk_widget_get_window(window));
+	GdkRectangle rect;
+	gdk_monitor_get_geometry(monitor, &rect);
+	if(width_percent) {
+		width = (width / 100.f) * rect.width;
+	}
+	if(height_percent) {
+		height = (height / 100.f) * rect.height;
+	}
+	update_surface_size();
+	free(geo_str);
+	return G_SOURCE_REMOVE;
+}
+
 void wofi_init(struct map* _config) {
 	config = _config;
-	width = strtol(config_get(config, "width", "1000"), NULL, 10);
-	height = strtol(config_get(config, "height", "400"), NULL, 10);
+	char* width_str = config_get(config, "width", "50%");
+	char* height_str = config_get(config, "height", "40%");
+	width = strtol(width_str, NULL, 10);
+	height = strtol(height_str, NULL, 10);
 	x = map_get(config, "x");
 	y = map_get(config, "y");
 	bool normal_window = strcmp(config_get(config, "normal_window", "false"), "true") == 0;
@@ -1363,9 +1389,11 @@ void wofi_init(struct map* _config) {
 	gtk_window_resize(GTK_WINDOW(window), width, height);
 	gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
 	gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+
 	if(!normal_window) {
-		wl_list_init(&outputs);
 		GdkDisplay* disp = gdk_display_get_default();
+		GdkWindow* gdk_win = gtk_widget_get_window(window);
+		wl_list_init(&outputs);
 		wl = gdk_wayland_display_get_wl_display(disp);
 		struct wl_registry* registry = wl_display_get_registry(wl);
 		struct wl_registry_listener listener = {
@@ -1404,7 +1432,6 @@ void wofi_init(struct map* _config) {
 			}
 		}
 
-		GdkWindow* gdk_win = gtk_widget_get_window(window);
 		gdk_wayland_window_set_use_custom_surface(gdk_win);
 		wl_surface = gdk_wayland_window_get_wl_surface(gdk_win);
 
@@ -1472,6 +1499,16 @@ void wofi_init(struct map* _config) {
 	g_signal_connect(window, "focus-out-event", G_CALLBACK(focus), NULL);
 
 	gdk_threads_add_timeout(filter_rate, do_search, NULL);
+
+
+	bool width_percent = strchr(width_str, '%') != NULL;
+	bool height_percent = strchr(height_str, '%') != NULL && lines == 0;
+	if(width_percent || height_percent) {
+		char** geo_str = malloc(sizeof(char*) * 2);
+		geo_str[0] = width_str;
+		geo_str[1] = height_str;
+		gdk_threads_add_timeout(70, do_percent_size, geo_str);
+	}
 
 	pthread_t thread;
 	pthread_create(&thread, NULL, start_thread, mode);
