@@ -401,6 +401,17 @@ static void expand(GtkExpander* expander, gpointer data) {
 	gtk_widget_set_visible(box, !gtk_expander_get_expanded(expander));
 }
 
+static void update_surface_size(void) {
+	if(wl != NULL) {
+		zwlr_layer_surface_v1_set_size(wlr_surface, width, height);
+		wl_surface_commit(wl_surface);
+		wl_display_roundtrip(wl);
+	}
+
+	gtk_window_resize(GTK_WINDOW(window), width, height);
+	gtk_widget_set_size_request(scroll, width, height);
+}
+
 static void widget_allocate(GtkWidget* widget, GdkRectangle* allocation, gpointer data) {
 	(void) data;
 	if(max_height > 0) {
@@ -421,14 +432,8 @@ static void widget_allocate(GtkWidget* widget, GdkRectangle* allocation, gpointe
 	} else {
 		max_height = allocation->height;
 	}
-	if(wl != NULL) {
-		zwlr_layer_surface_v1_set_size(wlr_surface, width, max_height * lines);
-		wl_surface_commit(wl_surface);
-		wl_display_roundtrip(wl);
-	}
-
-	gtk_window_resize(GTK_WINDOW(window), width, max_height * lines);
-	gtk_widget_set_size_request(scroll, width, max_height * lines);
+	height = max_height * lines;
+	update_surface_size();
 }
 
 static gboolean _insert_widget(gpointer data) {
@@ -1011,15 +1016,18 @@ static void do_exit(void) {
 	exit(1);
 }
 
-static void do_key_action(GdkEvent* event, char* mod, void (*action)(void)) {
+static bool do_key_action(GdkEvent* event, char* mod, void (*action)(void)) {
 	if(mod != NULL) {
 		GdkModifierType mask = get_mask_from_name(mod);
 		if((event->key.state & mask) == mask) {
 			event->key.state &= ~mask;
 			action();
+			return true;
 		}
+		return false;
 	} else {
 		action();
+		return true;
 	}
 }
 
@@ -1088,18 +1096,19 @@ static gboolean key_press(GtkWidget* widget, GdkEvent* event, gpointer data) {
 		return FALSE;
 	}
 
+	bool key_success = true;
 	if(event->key.keyval == gdk_keyval_from_name(key_up)) {
-		do_key_action(event, mod_up, move_up);
+		key_success = do_key_action(event, mod_up, move_up);
 	} else if(event->key.keyval == gdk_keyval_from_name(key_down)) {
-		do_key_action(event, mod_down, move_down);
+		key_success = do_key_action(event, mod_down, move_down);
 	} else if(event->key.keyval == gdk_keyval_from_name(key_left)) {
-		do_key_action(event, mod_left, move_left);
+		key_success = do_key_action(event, mod_left, move_left);
 	} else if(event->key.keyval == gdk_keyval_from_name(key_right)) {
-		do_key_action(event, mod_right, move_right);
+		key_success = do_key_action(event, mod_right, move_right);
 	} else if(event->key.keyval == gdk_keyval_from_name(key_forward)) {
-		do_key_action(event, mod_forward, move_forward);
+		key_success = do_key_action(event, mod_forward, move_forward);
 	} else if(event->key.keyval == gdk_keyval_from_name(key_backward)) {
-		do_key_action(event, mod_backward, move_backward);
+		key_success = do_key_action(event, mod_backward, move_backward);
 	} else if(event->key.keyval == gdk_keyval_from_name(key_submit)) {
 		mod_shift = (event->key.state & GDK_SHIFT_MASK) == GDK_SHIFT_MASK;
 		mod_ctrl = (event->key.state & GDK_CONTROL_MASK) == GDK_CONTROL_MASK;
@@ -1122,16 +1131,20 @@ static gboolean key_press(GtkWidget* widget, GdkEvent* event, gpointer data) {
 		}
 		g_list_free(children);
 	} else if(event->key.keyval == gdk_keyval_from_name(key_exit)) {
-		do_key_action(event, mod_exit, do_exit);
+		key_success = do_key_action(event, mod_exit, do_exit);
 	} else if(event->key.keyval == GDK_KEY_Shift_L || event->key.keyval == GDK_KEY_Control_L) {
 	} else if(event->key.keyval == GDK_KEY_Shift_R || event->key.keyval == GDK_KEY_Control_R) {
 	} else {
-		if(!gtk_widget_has_focus(entry)) {
-			gtk_entry_grab_focus_without_selecting(GTK_ENTRY(entry));
-		}
-		return FALSE;
+		key_success = false;
 	}
-	return TRUE;
+
+	if(key_success) {
+		return TRUE;
+	}
+	if(!gtk_widget_has_focus(entry)) {
+		gtk_entry_grab_focus_without_selecting(GTK_ENTRY(entry));
+	}
+	return FALSE;
 }
 
 static gboolean focus(GtkWidget* widget, GdkEvent* event, gpointer data) {
@@ -1230,27 +1243,6 @@ static struct mode* add_mode(char* _mode) {
 	return mode_ptr;
 }
 
-static void* start_thread(void* data) {
-	char* mode = data;
-
-	struct wl_list* modes = malloc(sizeof(struct wl_list));
-	wl_list_init(modes);
-
-	if(strchr(mode, ',') != NULL) {
-		char* save_ptr;
-		char* str = strtok_r(mode, ",", &save_ptr);
-		do {
-			struct mode* mode_ptr = add_mode(str);
-			wl_list_insert(modes, &mode_ptr->link);
-		} while((str = strtok_r(NULL, ",", &save_ptr)) != NULL);
-	} else {
-		struct mode* mode_ptr = add_mode(mode);
-		wl_list_insert(modes, &mode_ptr->link);
-	}
-	gdk_threads_add_idle(insert_all_widgets, modes);
-	return NULL;
-}
-
 static void parse_mods(char** key, char** mod) {
 	char* hyphen = strchr(*key, '-');
 	if(hyphen != NULL) {
@@ -1291,10 +1283,30 @@ static void get_output_pos(void* data, struct zxdg_output_v1* output, int32_t x,
 	node->y = y;
 }
 
+static gboolean do_percent_size(gpointer data) {
+	char** geo_str = data;
+	bool width_percent = strchr(geo_str[0], '%') != NULL;
+	bool height_percent = strchr(geo_str[1], '%') != NULL && lines == 0;
+	GdkMonitor* monitor = gdk_display_get_monitor_at_window(gdk_display_get_default(), gtk_widget_get_window(window));
+	GdkRectangle rect;
+	gdk_monitor_get_geometry(monitor, &rect);
+	if(width_percent) {
+		width = (width / 100.f) * rect.width;
+	}
+	if(height_percent) {
+		height = (height / 100.f) * rect.height;
+	}
+	update_surface_size();
+	free(geo_str);
+	return G_SOURCE_REMOVE;
+}
+
 void wofi_init(struct map* _config) {
 	config = _config;
-	width = strtol(config_get(config, "width", "1000"), NULL, 10);
-	height = strtol(config_get(config, "height", "400"), NULL, 10);
+	char* width_str = config_get(config, "width", "50%");
+	char* height_str = config_get(config, "height", "40%");
+	width = strtol(width_str, NULL, 10);
+	height = strtol(height_str, NULL, 10);
 	x = map_get(config, "x");
 	y = map_get(config, "y");
 	bool normal_window = strcmp(config_get(config, "normal_window", "false"), "true") == 0;
@@ -1363,9 +1375,11 @@ void wofi_init(struct map* _config) {
 	gtk_window_resize(GTK_WINDOW(window), width, height);
 	gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
 	gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+
 	if(!normal_window) {
-		wl_list_init(&outputs);
 		GdkDisplay* disp = gdk_display_get_default();
+		GdkWindow* gdk_win = gtk_widget_get_window(window);
+		wl_list_init(&outputs);
 		wl = gdk_wayland_display_get_wl_display(disp);
 		struct wl_registry* registry = wl_display_get_registry(wl);
 		struct wl_registry_listener listener = {
@@ -1404,7 +1418,6 @@ void wofi_init(struct map* _config) {
 			}
 		}
 
-		GdkWindow* gdk_win = gtk_widget_get_window(window);
 		gdk_wayland_window_set_use_custom_surface(gdk_win);
 		wl_surface = gdk_wayland_window_get_wl_surface(gdk_win);
 
@@ -1470,11 +1483,36 @@ void wofi_init(struct map* _config) {
 	g_signal_connect(window, "key-press-event", G_CALLBACK(key_press), NULL);
 	g_signal_connect(window, "focus-in-event", G_CALLBACK(focus), NULL);
 	g_signal_connect(window, "focus-out-event", G_CALLBACK(focus), NULL);
+	g_signal_connect(window, "destroy", G_CALLBACK(do_exit), NULL);
 
 	gdk_threads_add_timeout(filter_rate, do_search, NULL);
 
-	pthread_t thread;
-	pthread_create(&thread, NULL, start_thread, mode);
+
+	bool width_percent = strchr(width_str, '%') != NULL;
+	bool height_percent = strchr(height_str, '%') != NULL && lines == 0;
+	if(width_percent || height_percent) {
+		char** geo_str = malloc(sizeof(char*) * 2);
+		geo_str[0] = width_str;
+		geo_str[1] = height_str;
+		gdk_threads_add_timeout(70, do_percent_size, geo_str);
+	}
+
+	struct wl_list* modes = malloc(sizeof(struct wl_list));
+	wl_list_init(modes);
+
+	if(strchr(mode, ',') != NULL) {
+		char* save_ptr;
+		char* str = strtok_r(mode, ",", &save_ptr);
+		do {
+			struct mode* mode_ptr = add_mode(str);
+			wl_list_insert(modes, &mode_ptr->link);
+		} while((str = strtok_r(NULL, ",", &save_ptr)) != NULL);
+	} else {
+		struct mode* mode_ptr = add_mode(mode);
+		wl_list_insert(modes, &mode_ptr->link);
+	}
+	gdk_threads_add_idle(insert_all_widgets, modes);
+
 	gtk_window_set_title(GTK_WINDOW(window), prompt);
 	gtk_widget_show_all(window);
 }
